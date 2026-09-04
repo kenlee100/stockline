@@ -1,12 +1,14 @@
-import json, os, glob, pathlib
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, Request,  Header, BackgroundTasks, HTTPException, status
+import os
+import pathlib
+import tempfile
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, Header, HTTPException, Request
 from google import genai
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageSendMessage, AudioMessage
-import httpx
-import tempfile
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 # 設定 Google AI API 金鑰
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -25,15 +27,6 @@ working_status = os.getenv("DEFALUT_TALKING", default = "true").lower() == "true
 # 建立 FastAPI 應用程式
 app = FastAPI()
 
-# 設定 CORS，允許跨域請求
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # 處理根路徑請求
 @app.get("/")
 def root():
@@ -43,16 +36,13 @@ def root():
 @app.post("/webhook")
 async def webhook(
     request: Request,
-    background_tasks: BackgroundTasks,
     x_line_signature=Header(None),
 ):
     # 取得請求內容
     body = await request.body()
     try:
-        # 將處理 Line 事件的任務加入背景工作
-        background_tasks.add_task(
-            line_handler.handle, body.decode("utf-8"), x_line_signature
-        )
+        # 先完成簽章驗證，讓無效請求能立即得到 400 回應
+        line_handler.handle(body.decode("utf-8"), x_line_signature)
     except InvalidSignatureError:
         # 處理無效的簽章錯誤
         raise HTTPException(status_code=400, detail="Invalid signature")
@@ -82,19 +72,20 @@ def handle_message(event):
        
     # 檢查是否正在與使用者交談
     elif working_status:
-        try: 
+        temp_file_path = None
+        try:
             # 取得使用者輸入的文字
             question = event.message.text
             doc_url = "https://www.twse.com.tw/pdf/ch/"+question+"_ch.pdf"
-            doc_data = httpx.get(doc_url)
+            doc_data = httpx.get(doc_url, timeout=10.0)
             if doc_data.status_code != 200:
                 completion = '查無股票代號！請輸入台灣上市股票代號！'
             else:
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
                     temp_file.write(doc_data.content)
                     temp_file_path = temp_file.name
-                    sample_doc = client.files.upload(file=temp_file_path)
-                    prompt = "請給專業建議!"               
+                sample_doc = client.files.upload(file=temp_file_path)
+                prompt = "請給專業建議!"
                 # gemini-2.5-flash
                 completion = client.models.generate_content(
                                     model="gemini-3-flash-preview",
@@ -102,9 +93,12 @@ def handle_message(event):
                                     config=generation_config).text
             # 取得生成結果
             out = completion
-        except:
+        except Exception:
             # 處理錯誤
-            out = "Gemini執行出錯!請換個說法！" 
+            out = "Gemini執行出錯!請換個說法！"
+        finally:
+            if temp_file_path:
+                pathlib.Path(temp_file_path).unlink(missing_ok=True)
   
         # 回覆生成結果
         line_bot_api.reply_message(
